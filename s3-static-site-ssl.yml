@@ -1,4 +1,10 @@
-AWSTemplateFormatVersion: '2010-09-09'
+## Static site with SSL
+## This template takes in 3 parameters: a valid S3 bucket name, a hosted zone name, and the ARN of an Amazon Certificate
+## Manager certificate. This template assumes you already have a Route 53 hosted zone set up  for this domain.
+## If you have questions about getting a certificate from ACM, go here:
+## https://docs.aws.amazon.com/acm/latest/userguide/gs-acm-request.html
+## As an example: if I have the domain test.com and want to use this template, I would put the bucket name as 'test.com'
+## and the hosted zone would also be 'test.com', assuming that I've already set it up in Route53.
 Metadata: 
   License: Apache-2.0
 Description: 'AWS Static Website Hosted With S3 and CloudFront with SSL'
