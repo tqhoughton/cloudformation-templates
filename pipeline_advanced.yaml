@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  ServiceName:
+    Type: String
+    Default: ServerlessDemo
+    Description: Name for the service, used in the code repository, Lambda function, and pipeline names
+  TestSiteStackName:
+    Type: String
+    Description: The stack name that has the S3 bucket and CloudFront distribution for the Test stage.
+  ProdSiteStackName:
+    Type: String
+    Description: The stack name that has the S3 bucket and CloudFront distribution for the Prod stage.
+Resources:
+  # Code repository for the service
+  CodeRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub '${ServiceName}_repo'
+      RepositoryDescription: !Sub 'Repository for the ${ServiceName} service'
+
+  # CodeBuild project and resources (S3 Bucket for build artifacts, Role, Project)
+  BuildArtifactsBucket:
+    Type: AWS::S3::Bucket
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 
+            - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_build'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_build:*'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+                Action: 
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ServiceName}_build'
+      Description: Build project for the Lambda service
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment: 
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/eb-nodejs-6.10.0-amazonlinux-64:4.0.0
+        EnvironmentVariables:
+          - Name: BUILD_OUTPUT_BUCKET
+            Value: !Ref BuildArtifactsBucket
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source: 
+        Type: CODEPIPELINE
+
+  CodeBuildSiteDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 
+            - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildS3DeployAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_site_deploy_test'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_site_deploy_test:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_site_deploy_prod'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_site_deploy_prod:*'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+                  - !Join
+                    - ''
+                    -
+                      - 'arn:aws:s3:::'
+                      - Fn::ImportValue:
+                          !Sub '${TestSiteStackName}-Bucket'
+                      - '/*'
+                  - !Join
+                    - ''
+                    -
+                      - 'arn:aws:s3:::'
+                      - Fn::ImportValue:
+                          !Sub '${ProdSiteStackName}-Bucket'
+                      - '/*'
+                Action: 
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-Test'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-Test/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-Prod'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-Prod/*'
+                Action:
+                  - 'cloudformation:DescribeStacks'
+              - Effect: Allow
+                Resource:
+                  - '*'
+                Action:
+                  - 'cloudfront:CreateInvalidation'
+  
+  # CodeBuild to deploy test stage site
+  CodeBuildSiteDeployTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ServiceName}_site_deploy_test'
+      Description: Builds app and deploys to S3 bucket. Creates CloudFront invalidation.
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment: 
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:6.3.1
+        # Image: aws/codebuild/eb-nodejs-6.10.0-amazonlinux-64:4.0.0
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Sub '${ServiceName}-Test'
+          - Name: SITE_BUCKET
+            Value:
+              Fn::ImportValue:
+                !Join [ '', [!Ref TestSiteStackName, -Bucket] ]
+          - Name: CLOUDFRONT_DIST_ID
+            Value:
+              Fn::ImportValue:
+                !Join [ '', [!Ref TestSiteStackName, -CloudFrontDist] ]
+      ServiceRole: !GetAtt CodeBuildSiteDeployServiceRole.Arn
+      Source: 
+        Type: CODEPIPELINE
+        BuildSpec: s3/buildspec.yaml
+  
+  #Codebuild to deploy prod stage site
+  CodeBuildSiteDeployProd:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ServiceName}_site_deploy_prod'
+      Description: Builds app and deploys to S3 bucket. Creates CloudFront invalidation.
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment: 
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:6.3.1
+        # Image: aws/codebuild/eb-nodejs-6.10.0-amazonlinux-64:4.0.0
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Sub '${ServiceName}-Test'
+          - Name: SITE_BUCKET
+            Value:
+              Fn::ImportValue:
+                !Join [ '', [!Ref ProdSiteStackName, -Bucket] ]
+          - Name: CLOUDFRONT_DIST_ID
+            Value:
+              Fn::ImportValue:
+                !Join [ '', [!Ref ProdSiteStackName, -CloudFrontDist] ]
+      ServiceRole: !GetAtt CodeBuildSiteDeployServiceRole.Arn
+      Source: 
+        Type: CODEPIPELINE
+        BuildSpec: s3/buildspec.yaml
+  
+  CodeBuildUnitTestServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 
+            - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildS3DeployAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_unit_test'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ServiceName}_unit_test:*'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-Test'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ServiceName}-Test/*'
+                Action:
+                  - 'cloudformation:DescribeStacks'
+              - Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+                Action: 
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+
+  # CodeBuild to do unit tests on test stage API
+  CodeBuildUnitTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ServiceName}_unit_test'
+      Description: Builds app and deploys to S3 bucket. Creates CloudFront invalidation.
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment: 
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:8.11.0
+        # Image: aws/codebuild/eb-nodejs-6.10.0-amazonlinux-64:4.0.0
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            Value: !Sub '${ServiceName}-Test'
+      ServiceRole: !GetAtt CodeBuildUnitTestServiceRole.Arn
+      Source: 
+        Type: CODEPIPELINE
+        BuildSpec: test/buildspec.yaml
+  
+  # CodePipeline definition and required roles
+  CFNPipelinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: CloudFormation Pipeline Execution Policy
+      Path: "/"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Action: 
+            - 'cloudformation:CreateStack'
+            - 'cloudformation:DescribeStacks'
+            - 'cloudformation:DeleteStack'
+            - 'cloudformation:UpdateStack'
+            - 'cloudformation:CreateChangeSet'
+            - 'cloudformation:ExecuteChangeSet'
+            - 'cloudformation:DeleteChangeSet'
+            - 'cloudformation:DescribeChangeSet'
+            - 'cloudformation:SetStackPolicy'
+            - 'cloudformation:SetStackPolicy'
+            - 'cloudformation:ValidateTemplate'
+            - 'codebuild:StartBuild'
+            - 'codebuild:BatchGetBuilds'
+          Resource: "*"
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Action: 
+            - 'sts:AssumeRole'
+          Effect: Allow
+          Principal:
+            Service:
+              - cloudformation.amazonaws.com
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+  PipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 
+            - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: 
+                - codepipeline.amazonaws.com
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodeCommitFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+        - !Ref CFNPipelinePolicy
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'iam:PassRole'
+                - 'lambda:InvokeFunction'
+                - 'lambda:ListFunctions'
+                - 'lambda:InvokeAsyc'
+                Effect: Allow
+                Resource: '*'
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore: 
+        Location: !Ref BuildArtifactsBucket
+        Type: S3
+      Name: !Sub ${ServiceName}_pipeline
+      RoleArn: !GetAtt PipelineExecutionRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+          - Name: CodeCommitRepo
+            ActionTypeId:
+              Category: Source
+              Owner: AWS
+              Provider: CodeCommit
+              Version: 1
+            Configuration:
+              RepositoryName: !Sub '${ServiceName}_repo'
+              BranchName: master
+            OutputArtifacts:
+            - Name: SourceZip
+            RunOrder: 1
+        - Name: Build
+          Actions:
+          - Name: CodeBuild
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Provider: CodeBuild
+              Version: 1
+            Configuration:
+              ProjectName: !Ref CodeBuildProject
+            InputArtifacts:
+            - Name: SourceZip
+            OutputArtifacts:
+            - Name: BuiltZip
+        - Name: TestStageDeploy
+          Actions:
+          - Name: CreateChangeSet
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: 1
+            Configuration:
+              ActionMode: CHANGE_SET_REPLACE
+              RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              StackName: !Sub '${ServiceName}-Test'
+              ChangeSetName: !Sub '${ServiceName}-ChangeSet-Test'
+              TemplatePath: BuiltZip::output.yaml
+              Capabilities: CAPABILITY_IAM
+            InputArtifacts:
+            - Name: BuiltZip
+            RunOrder: 1
+          - Name: ExecuteChangeSet
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: 1
+            Configuration:
+              ActionMode: CHANGE_SET_EXECUTE
+              RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              StackName: !Sub '${ServiceName}-Test'
+              ChangeSetName: !Sub '${ServiceName}-ChangeSet-Test'
+            OutputArtifacts:
+            - Name: !Sub '${ServiceName}ChangeSetTest'
+            RunOrder: 2
+          - Name: SiteDeploy
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Provider: CodeBuild
+              Version: 1
+            Configuration:
+              ProjectName: !Ref CodeBuildSiteDeployTest
+            InputArtifacts:
+            - Name: SourceZip
+            RunOrder: 3
+          - Name: UnitTest
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Provider: CodeBuild
+              Version: 1
+            Configuration:
+              ProjectName: !Ref CodeBuildUnitTest
+            InputArtifacts:
+            - Name: SourceZip
+            RunOrder: 4
+        - Name: ProdStageDeploy
+          Actions:
+          - Name: CreateChangeSet
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: 1
+            Configuration:
+              ActionMode: CHANGE_SET_REPLACE
+              RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              StackName: !Sub '${ServiceName}-Prod'
+              ChangeSetName: !Sub '${ServiceName}-ChangeSet-Prod'
+              TemplatePath: BuiltZip::output.yaml
+              Capabilities: CAPABILITY_IAM
+            InputArtifacts:
+            - Name: BuiltZip
+            RunOrder: 1
+          - Name: ExecuteChangeSet
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: 1
+            Configuration:
+              ActionMode: CHANGE_SET_EXECUTE
+              RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+              StackName: !Sub '${ServiceName}-Prod'
+              ChangeSetName: !Sub '${ServiceName}-ChangeSet-Prod'
+            OutputArtifacts:
+            - Name: !Sub '${ServiceName}ChangeSetProd'
+            RunOrder: 2
+          - Name: SiteDeploy
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Provider: CodeBuild
+              Version: 1
+            Configuration:
+              ProjectName: !Ref CodeBuildSiteDeployProd
+            InputArtifacts:
+            - Name: SourceZip
+            RunOrder: 3
